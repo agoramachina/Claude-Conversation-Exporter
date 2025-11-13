@@ -49,6 +49,7 @@ let allConversations = [];
 let filteredConversations = [];
 let allProjects = [];
 let projectsMap = {}; // Map project UUID to project name
+let conversationArtifacts = new Map(); // Map conversation UUID to artifact count
 let orgId = null;
 let currentSort = 'updated_desc';
 let sortStack = []; // Track multi-level sorting: [{field: 'name', direction: 'asc'}, ...]
@@ -280,6 +281,13 @@ function sortConversations() {
           aVal = formatModelName(a.model || '').toLowerCase();
           bVal = formatModelName(b.model || '').toLowerCase();
           break;
+        case 'artifacts':
+          aVal = conversationArtifacts.get(a.uuid);
+          bVal = conversationArtifacts.get(b.uuid);
+          // Treat undefined as -1 so unscanned conversations sort to bottom/top consistently
+          aVal = aVal !== undefined ? aVal : -1;
+          bVal = bVal !== undefined ? bVal : -1;
+          break;
         default:
           continue;
       }
@@ -347,6 +355,7 @@ function displayConversations() {
           <th class="sortable" data-sort="updated">Last Updated${getSortIndicator('updated')}</th>
           <th class="sortable" data-sort="created">Created${getSortIndicator('created')}</th>
           <th class="sortable" data-sort="model">Model${getSortIndicator('model')}</th>
+          <th class="sortable artifacts-col" data-sort="artifacts">Artifacts${getSortIndicator('artifacts')}</th>
           <th>Actions</th>
           <th class="checkbox-col">
             <input type="checkbox" id="selectAll" class="select-all-checkbox" ${selectedConversations.size > 0 ? 'checked' : ''}>
@@ -361,6 +370,10 @@ function displayConversations() {
     const createdDate = new Date(conv.created_at).toLocaleDateString();
     const modelBadgeClass = getModelBadgeClass(conv.model);
     const projectName = getProjectName(conv);
+    const artifactCount = conversationArtifacts.get(conv.uuid);
+    const artifactIndicator = artifactCount !== undefined
+      ? (artifactCount > 0 ? artifactCount : '-')
+      : '';
 
     html += `
       <tr data-id="${conv.uuid}">
@@ -379,6 +392,7 @@ function displayConversations() {
             ${formatModelName(conv.model)}
           </span>
         </td>
+        <td class="artifacts-col">${artifactIndicator}</td>
         <td>
           <div class="actions">
             <button class="btn-small btn-export" data-id="${conv.uuid}" data-name="${conv.name}">
@@ -524,10 +538,22 @@ function updateExportButtonText() {
   const exportBtn = document.getElementById('exportAllBtn');
   if (!exportBtn) return;
 
-  if (selectedConversations.size > 0) {
-    exportBtn.textContent = `Export Selected (${selectedConversations.size})`;
+  const includeChats = document.getElementById('includeChats').checked;
+  const extractArtifacts = document.getElementById('extractArtifacts').checked;
+  const flattenArtifacts = document.getElementById('flattenArtifacts').checked;
+  const includeGlobalMemory = document.getElementById('includeGlobalMemory').checked;
+  const includeProjectMemory = document.getElementById('includeProjectMemory').checked;
+
+  // If only global memory is selected, change button to "Export"
+  if (includeGlobalMemory && !includeChats && !extractArtifacts && !flattenArtifacts && !includeProjectMemory) {
+    exportBtn.textContent = 'Export';
   } else {
-    exportBtn.textContent = 'Export All';
+    // Otherwise, use normal "Export All" or "Export Selected" logic
+    if (selectedConversations.size > 0) {
+      exportBtn.textContent = `Export Selected (${selectedConversations.size})`;
+    } else {
+      exportBtn.textContent = 'Export All';
+    }
   }
 }
 
@@ -573,6 +599,12 @@ async function exportConversation(conversationId, conversationName) {
     // Check if we need to extract artifacts to separate files
     if (extractArtifacts || flattenArtifacts) {
       const artifactFiles = extractArtifactFiles(data, artifactFormat);
+
+      // Update artifact count for this conversation
+      if (artifactFiles.length > 0) {
+        conversationArtifacts.set(conversationId, artifactFiles.length);
+        displayConversations(); // Refresh table to show indicator
+      }
 
       if (artifactFiles.length > 0) {
         // Create a ZIP with artifacts (and optionally conversation)
@@ -715,11 +747,42 @@ async function exportAllFiltered() {
   const extractArtifacts = document.getElementById('extractArtifacts').checked;
   const artifactFormat = document.getElementById('artifactFormat').value;
   const flattenArtifacts = document.getElementById('flattenArtifacts').checked;
+  const includeGlobalMemory = document.getElementById('includeGlobalMemory').checked;
+  const includeProjectMemory = document.getElementById('includeProjectMemory').checked;
 
   const button = document.getElementById('exportAllBtn');
   button.disabled = true;
   const originalButtonText = button.textContent;
   button.textContent = 'Preparing...';
+
+  // Special case: only global memory selected, no chats/artifacts
+  if (includeGlobalMemory && !includeChats && !extractArtifacts && !flattenArtifacts && !includeProjectMemory) {
+    try {
+      const memory = await fetchMemory(orgId, true, false);
+      if (memory.global && memory.global.length > 0) {
+        const now = new Date();
+        const datetime = now.toISOString().replace(/[:.]/g, '-').slice(0, 19).replace('T', '_');
+        const content = format === 'json'
+          ? JSON.stringify(memory.global, null, 2)
+          : format === 'markdown'
+          ? formatMemoryMarkdown({ global: memory.global, projects: [] })
+          : formatMemoryText({ global: memory.global, projects: [] });
+        const ext = format === 'json' ? 'json' : format === 'markdown' ? 'md' : 'txt';
+        downloadFile(content, `global-memory-${datetime}.${ext}`,
+          format === 'json' ? 'application/json' : format === 'markdown' ? 'text/markdown' : 'text/plain');
+        showToast('Exported global memory');
+      } else {
+        showToast('No global memory found', true);
+      }
+    } catch (error) {
+      console.error('Memory export error:', error);
+      showToast(`Failed to export memory: ${error.message}`, true);
+    } finally {
+      button.disabled = false;
+      button.textContent = originalButtonText;
+    }
+    return;
+  }
 
   // Determine which conversations to export
   let conversationsToExport;
@@ -883,6 +946,102 @@ async function exportAllFiltered() {
       return;
     }
 
+    // Export memory if selected
+    if (includeGlobalMemory || includeProjectMemory) {
+      progressText.textContent = 'Fetching memory...';
+
+      try {
+        // Collect unique project IDs from conversations being exported
+        const projectIds = new Set();
+        if (includeProjectMemory) {
+          conversationsToExport.forEach(conv => {
+            const projectId = conv.project_uuid || conv.project_id || conv.projectUuid;
+            if (projectId) {
+              projectIds.add(projectId);
+            }
+          });
+        }
+
+        // Fetch global memory if requested
+        let globalMemory = null;
+        if (includeGlobalMemory) {
+          try {
+            const response = await fetch(`https://claude.ai/api/organizations/${orgId}/memories`, {
+              credentials: 'include',
+              headers: { 'Accept': 'application/json' }
+            });
+            if (response.ok) {
+              globalMemory = await response.json();
+            }
+          } catch (error) {
+            console.warn('Failed to fetch global memory:', error);
+          }
+        }
+
+        // Fetch project memories for specific projects if requested
+        const projectMemories = [];
+        if (includeProjectMemory && projectIds.size > 0) {
+          for (const projectId of projectIds) {
+            try {
+              const response = await fetch(
+                `https://claude.ai/api/organizations/${orgId}/projects/${projectId}/memories`,
+                {
+                  credentials: 'include',
+                  headers: { 'Accept': 'application/json' }
+                }
+              );
+              if (response.ok) {
+                const memory = await response.json();
+                const project = allProjects.find(p => (p.uuid || p.id) === projectId);
+                projectMemories.push({
+                  uuid: projectId,
+                  name: project ? (project.name || project.title) : projectId,
+                  memory: memory
+                });
+              }
+            } catch (error) {
+              console.warn(`Failed to fetch memory for project ${projectId}:`, error);
+            }
+          }
+        }
+
+        // Create Memory folder and add memory files
+        if (globalMemory || projectMemories.length > 0) {
+          const memoryFolder = zip.folder('Memory');
+          const now = new Date();
+          const datetime = now.toISOString().replace(/[:.]/g, '-').slice(0, 19).replace('T', '_');
+
+          // Add global memory if present
+          if (globalMemory && globalMemory.length > 0) {
+            const globalContent = format === 'json'
+              ? JSON.stringify(globalMemory, null, 2)
+              : format === 'markdown'
+              ? formatMemoryMarkdown({ global: globalMemory, projects: [] })
+              : formatMemoryText({ global: globalMemory, projects: [] });
+            const ext = format === 'json' ? 'json' : format === 'markdown' ? 'md' : 'txt';
+            memoryFolder.file(`global-memory-${datetime}.${ext}`, globalContent);
+          }
+
+          // Add project memories if present
+          projectMemories.forEach(project => {
+            if (project.memory && project.memory.length > 0) {
+              const projectSafeName = project.name.replace(/[<>:"/\\|?*]/g, '_');
+              const projectContent = format === 'json'
+                ? JSON.stringify(project.memory, null, 2)
+                : format === 'markdown'
+                ? formatMemoryMarkdown({ global: null, projects: [project] })
+                : formatMemoryText({ global: null, projects: [project] });
+              const ext = format === 'json' ? 'json' : format === 'markdown' ? 'md' : 'txt';
+              memoryFolder.file(`${projectSafeName}-memory-${datetime}.${ext}`, projectContent);
+            }
+          });
+        }
+      } catch (error) {
+        console.error('Memory export error:', error);
+        // Continue with export even if memory fails
+      }
+    }
+
     // Generate and download the ZIP file
     progressText.textContent = 'Creating ZIP file...';
     const blob = await zip.generateAsync({
@@ -930,63 +1089,6 @@ async function exportAllFiltered() {
   }
 }
 
-// Export memory
-async function exportMemory() {
-  const format = document.getElementById('memoryFormat').value;
-  const includeGlobal = document.getElementById('includeGlobalMemory').checked;
-  const includeProject = document.getElementById('includeProjectMemory').checked;
-
-  if (!includeGlobal && !includeProject) {
-    showToast('Please select at least one memory type to export (Global or Project)', true);
-    return;
-  }
-
-  const button = document.getElementById('exportMemoryBtn');
-  button.disabled = true;
-  const originalButtonText = button.textContent;
-  button.textContent = 'Fetching...';
-
-  try {
-    const memory = await fetchMemory(orgId, includeGlobal, includeProject);
-
-    if (!memory.global && !memory.project) {
-      showToast('No memory data found', true);
-      return;
-    }
-
-    // Generate filename and content based on format
-    let content, filename;
-    const now = new Date();
-    const datetime = now.toISOString().replace(/[:.]/g, '-').slice(0, 19).replace('T', '_');
-
-    switch (format) {
-      case 'markdown':
-        content = formatMemoryMarkdown(memory);
-        filename = `claude-memory-${datetime}.md`;
-        break;
-      case 'text':
-        content = formatMemoryText(memory);
-        filename = `claude-memory-${datetime}.txt`;
-        break;
-      case 'json':
-        content = JSON.stringify(memory, null, 2);
-        filename = `claude-memory-${datetime}.json`;
-        break;
-    }
-
-    // Download the file
-    downloadFile(content, filename);
-    showToast('Memory exported successfully!');
-
-  } catch (error) {
-    console.error('Memory export error:', error);
-    showToast(`Export failed: ${error.message}`, true);
-  } finally {
-    button.disabled = false;
-    button.textContent = originalButtonText;
-  }
-}
-
 // Conversion functions are now imported from utils.js
 // Functions available: getCurrentBranch, convertToMarkdown, convertToText, downloadFile
 
@@ -1002,10 +1104,83 @@ function showToast(message, isError = false) {
   toast.textContent = message;
   toast.style.background = isError ? '#d32f2f' : '#333';
   toast.classList.add('show');
-  
+
   setTimeout(() => {
     toast.classList.remove('show');
   }, 3000);
+}
+
+// Scan all filtered conversations for artifacts
+async function scanArtifacts() {
+  const button = document.getElementById('scanArtifactsBtn');
+  button.disabled = true;
+
+  const conversationsToScan = filteredConversations;
+  const total = conversationsToScan.length;
+  let scanned = 0;
+  let totalArtifacts = 0;
+
+  try {
+    // Process conversations in batches to avoid overwhelming the API
+    const batchSize = 3;
+    for (let i = 0; i < total; i += batchSize) {
+      const batch = conversationsToScan.slice(i, Math.min(i + batchSize, total));
+      const promises = batch.map(async (conv) => {
+        try {
+          const response = await fetch(
+            `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conv.uuid}?tree=True&rendering_mode=messages&render_all_tools=true`,
+            {
+              credentials: 'include',
+              headers: {
+                'Accept': 'application/json',
+              }
+            }
+          );
+
+          if (!response.ok) {
+            console.warn(`Failed to fetch conversation ${conv.uuid}: ${response.status}`);
+            conversationArtifacts.set(conv.uuid, 0);
+            return;
+          }
+
+          const data = await response.json();
+          const artifactFiles = extractArtifactFiles(data, 'original');
+          const count = artifactFiles.length;
+          conversationArtifacts.set(conv.uuid, count);
+          if (count > 0) {
+            totalArtifacts += count;
+          }
+        } catch (error) {
+          console.error(`Error scanning ${conv.name}:`, error);
+          conversationArtifacts.set(conv.uuid, 0);
+        }
+      });
+
+      await Promise.all(promises);
+      scanned += batch.length;
+
+      // Update button text with progress
+      button.textContent = `Scanned ${scanned}/${total}`;
+
+      // Small delay between batches
+      if (i + batchSize < total) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+
+    // Update button text with final count
+    button.textContent = `${totalArtifacts} Artifacts found`;
+
+    // Refresh table to show artifact counts
+    displayConversations();
+
+  } catch (error) {
+    console.error('Scan error:', error);
+    showToast(`Scan failed: ${error.message}`, true);
+    button.textContent = 'Search Artifacts';
+  } finally {
+    button.disabled = false;
+  }
 }
 
 // Setup event listeners
@@ -1035,6 +1210,13 @@ function setupEventListeners() {
   includeChatsCheckbox.addEventListener('change', updateCheckboxStates);
   updateCheckboxStates(); // Initialize on load
 
+  // Listen to all checkboxes that affect export button text
+  document.getElementById('includeChats').addEventListener('change', updateExportButtonText);
+  document.getElementById('extractArtifacts').addEventListener('change', updateExportButtonText);
+  document.getElementById('flattenArtifacts').addEventListener('change', updateExportButtonText);
+  document.getElementById('includeGlobalMemory').addEventListener('change', updateExportButtonText);
+  document.getElementById('includeProjectMemory').addEventListener('change', updateExportButtonText);
+
   // Theme toggle
   document.getElementById('themeToggle').addEventListener('click', toggleTheme);
 
@@ -1057,9 +1239,9 @@ function setupEventListeners() {
     applyFiltersAndSort();
   });
 
+  // Scan artifacts button
+  document.getElementById('scanArtifactsBtn').addEventListener('click', scanArtifacts);
+
   // Export all button
   document.getElementById('exportAllBtn').addEventListener('click', exportAllFiltered);
-
-  // Export Memory button
-  document.getElementById('exportMemoryBtn').addEventListener('click', exportMemory);
 }
